@@ -8,10 +8,10 @@
 //! extern crate futures_mutex;
 //!
 //! use futures::{Future, Poll, Async};
-//! use futures_mutex::FutMutex;
+//! use futures_mutex::Mutex;
 //!
 //! struct AddTwo {
-//!     lock: FutMutex<usize>
+//!     lock: Mutex<usize>
 //! }
 //!
 //! impl Future for AddTwo {
@@ -29,7 +29,7 @@
 //! }
 //!
 //! fn main() {
-//!     let lock1: FutMutex<usize> = FutMutex::new(0);
+//!     let lock1: Mutex<usize> = Mutex::new(0);
 //!     let lock2 = lock1.clone();
 //!
 //!     let future = AddTwo { lock: lock2 };
@@ -81,20 +81,20 @@ unsafe impl<T: Send> Sync for Inner<T> {}
 ///
 /// *As of now, there is no strong guarantee that a particular handle of the lock won't be starved. Hopefully the use of the queue will prevent this, but I haven't tried to test that.*
 #[derive(Debug)]
-pub struct FutMutex<T> {
+pub struct Mutex<T> {
     inner: Arc<Inner<T>>
 }
 
-impl<T> FutMutex<T> {
-    /// Create a new FutMutex wrapping around a value `t`
-    pub fn new(t: T) -> FutMutex<T> {
+impl<T> Mutex<T> {
+    /// Create a new Mutex wrapping around a value `t`
+    pub fn new(t: T) -> Mutex<T> {
         let inner = Arc::new(Inner {
             wait_queue: MsQueue::new(),
             locked: AtomicBool::new(false),
             data: UnsafeCell::new(t)
         });
 
-        FutMutex {
+        Mutex {
             inner: inner
         }
     }
@@ -102,7 +102,7 @@ impl<T> FutMutex<T> {
     /// This will attempt a non-blocking lock on the mutex, returning `Async::NotReady` if it
     /// can't be acquired.
     ///
-    /// This function will return immediatly with a `FutMutexGuard` if the lock was acquired
+    /// This function will return immediatly with a `MutexGuard` if the lock was acquired
     /// successfully. When it drops, the lock will be unlocked.
     ///
     /// If it can't acquire the lock, it will schedule the current task to be unparked when it
@@ -111,33 +111,32 @@ impl<T> FutMutex<T> {
     /// # Panics
     ///
     /// This function will panic if called outside the context of a future's task.
-    pub fn poll_lock(&self) -> Async<FutMutexGuard<T>> {
+    pub fn poll_lock(&self) -> Async<MutexGuard<T>> {
         if self.inner.locked.compare_and_swap(false, true, Ordering::SeqCst) {
             self.inner.wait_queue.push(current());
             Async::NotReady
         } else {
-            Async::Ready(FutMutexGuard{ inner: self })
+            Async::Ready(MutexGuard{ inner: self })
         }
     }
 
     /// Convert this lock into a future that resolves to a guard that allows access to the data.
-    /// This function returns `FutMutexAcquire<T>`, which resolves to a `FutMutexAcquired<T>`
+    /// This function returns `MutexAcquire<T>`, which resolves to a `MutexGuard<T>`
     /// guard type.
     ///
     /// The returned future will never return an error.
-    pub fn lock(self) -> FutMutexAcquire<T> {
-        FutMutexAcquire {
+    pub fn lock(&self) -> MutexAcquire<T> {
+        MutexAcquire {
             inner: self
         }
     }
-
 
     /// We unlock the mutex and wait for someone to lock. We try and unpark as many tasks as we
     /// can to prevents dead tasks from deadlocking the mutex, or tasks that have finished their
     /// critical section and were awakened.
     fn unlock(&self) {
         if !self.inner.locked.swap(false, Ordering::SeqCst) {
-            panic!("Tried to unlock an already unlocked FutMutex, something has gone terribly wrong");
+            panic!("Tried to unlock an already unlocked Mutex, something has gone terribly wrong");
         }
 
         while !self.inner.locked.load(Ordering::SeqCst) {
@@ -149,9 +148,9 @@ impl<T> FutMutex<T> {
     }
 }
 
-impl<T> Clone for FutMutex<T> {
-    fn clone(&self) -> FutMutex<T> {
-        FutMutex {
+impl<T> Clone for Mutex<T> {
+    fn clone(&self) -> Mutex<T> {
+        Mutex {
             inner: self.inner.clone()
         }
     }
@@ -159,90 +158,45 @@ impl<T> Clone for FutMutex<T> {
 
 /// Returned RAII guard from the `poll_lock` method.
 ///
-/// This structure acts as a sentinel to the data in the `FutMutex<T>` itself,
+/// This structure acts as a sentinel to the data in the `Mutex<T>` itself,
 /// implementing `Deref` and `DerefMut` to `T`. When dropped, the lock will be
 /// unlocked.
 #[derive(Debug)]
-pub struct FutMutexGuard<'a, T: 'a> {
-    inner: &'a FutMutex<T>
+pub struct MutexGuard<'a, T: 'a> {
+    inner: &'a Mutex<T>
 }
 
-impl<'a, T> Deref for FutMutexGuard<'a, T> {
+impl<'a, T> Deref for MutexGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.inner.inner.data.get() }
     }
 }
 
-impl<'a, T> DerefMut for FutMutexGuard<'a, T> {
+impl<'a, T> DerefMut for MutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.inner.inner.data.get() }
     }
 }
 
-impl<'a, T> Drop for FutMutexGuard<'a, T> {
+impl<'a, T> Drop for MutexGuard<'a, T> {
     fn drop(&mut self) {
         self.inner.unlock();
     }
 }
 
-/// Future returned by `FutMutex::lock` which resolves to a guard when a lock is acquired.
+/// Future returned by `Mutex::lock` which resolves to a guard when a lock is acquired.
 #[derive(Debug)]
-pub struct FutMutexAcquire<T> {
-    inner: FutMutex<T>
+pub struct MutexAcquire<'a, T: 'a> {
+    inner: &'a Mutex<T>
 }
 
-impl<T> Future for FutMutexAcquire<T> {
-    type Item = FutMutexAcquired<T>;
+impl<'a, T> Future for MutexAcquire<'a, T> {
+    type Item = MutexGuard<'a, T>;
     type Error = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.inner.poll_lock() {
-            Async::Ready(r) => {
-                mem::forget(r);
-                Ok(FutMutexAcquired {
-                    inner: FutMutex{ inner: self.inner.inner.clone() }
-                }.into())
-            },
-            Async::NotReady => Ok(Async::NotReady)
-        }
-    }
-}
-
-#[derive(Debug)]
-/// Resolved value of `FutMutexAcquire<T>` future
-///
-/// This value works like `FutMutexGuard<T>`, providing a RAII guard to the value `T` through
-/// `Deref` and `DerefMut`. Will unlock the lock when dropped; the original `FutMutex` can be
-/// recovered with `unlock()`.
-pub struct FutMutexAcquired<T> {
-    inner: FutMutex<T>
-}
-
-impl<T> FutMutexAcquired<T> {
-    pub fn unlock(self) -> FutMutex<T> {
-        FutMutex {
-            inner: self.inner.inner.clone()
-        }
-    }
-}
-
-impl<T> Deref for FutMutexAcquired<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.inner.inner.data.get() }
-    }
-}
-
-impl<T> DerefMut for FutMutexAcquired<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.inner.inner.data.get() }
-    }
-}
-
-impl<T> Drop for FutMutexAcquired<T> {
-    fn drop(&mut self) {
-        self.inner.unlock();
+        Ok(self.inner.poll_lock())
     }
 }
 
@@ -267,7 +221,7 @@ mod tests {
     #[test]
     fn simple() {
         let future = future::lazy(|| {
-            let lock1 = FutMutex::new(1);
+            let lock1 = Mutex::new(1);
             let lock2 = lock1.clone();
             let lock3 = lock1.clone();
 
@@ -301,7 +255,7 @@ mod tests {
         });
 
         assert!(executor::spawn(future)
-                .poll_future(unpark_noop())
+                .poll_future_notify(unpark_noop())
                 .expect("failure in poll")
                 .is_ready());
     }
@@ -309,14 +263,14 @@ mod tests {
     #[test]
     fn concurrent() {
         const N: usize = 10000;
-        let lock1 = FutMutex::new(0);
+        let lock1 = Mutex::new(0);
         let lock2 = lock1.clone();
 
         let a = Increment {
             a: Some(lock1),
             remaining: N,
         };
-        let b = stream::iter((0..N).map(Ok::<_, ()>)).fold(lock2, |b, _n| {
+        let b = stream::iter_ok((0..N).map(Ok::<_, ()>)).fold(lock2, |b, _n| {
             b.lock().map(|mut b| {
                 *b += 1;
                 b.unlock()
@@ -338,14 +292,14 @@ mod tests {
 
         struct Increment {
             remaining: usize,
-            a: Option<FutMutex<usize>>,
+            a: Option<Mutex<usize>>,
         }
 
         impl Future for Increment {
-            type Item = FutMutex<usize>;
+            type Item = Mutex<usize>;
             type Error = ();
 
-            fn poll(&mut self) -> Poll<FutMutex<usize>, ()> {
+            fn poll(&mut self) -> Poll<Mutex<usize>, ()> {
                 loop {
                     if self.remaining == 0 {
                         return Ok(self.a.take().unwrap().into())
